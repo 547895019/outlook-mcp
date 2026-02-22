@@ -56,24 +56,36 @@ async function handleAuthenticate(args) {
 async function handleCheckAuthStatus() {
   console.error('[CHECK-AUTH-STATUS] Starting authentication status check');
   
-  const tokens = tokenManager.loadTokenCache();
-  
-  console.error(`[CHECK-AUTH-STATUS] Tokens loaded: ${tokens ? 'YES' : 'NO'}`);
-  
-  if (!tokens || !tokens.access_token) {
-    console.error('[CHECK-AUTH-STATUS] No valid access token found');
+  try {
+    // Try to get access token with auto-refresh
+    const accessToken = await tokenManager.getAccessToken();
+    
+    if (!accessToken) {
+      console.error('[CHECK-AUTH-STATUS] No valid access token found');
+      return {
+        content: [{ type: "text", text: "Not authenticated" }]
+      };
+    }
+    
+    // Load tokens to get expiry info
+    const tokens = tokenManager.loadTokenCache();
+    const expiresAt = tokens ? new Date(tokens.expires_at).toLocaleString() : 'unknown';
+    
+    console.error('[CHECK-AUTH-STATUS] Access token valid');
+    console.error(`[CHECK-AUTH-STATUS] Token expires at: ${expiresAt}`);
+    
+    return {
+      content: [{ 
+        type: "text", 
+        text: `Authenticated and ready (token expires at: ${expiresAt})` 
+      }]
+    };
+  } catch (error) {
+    console.error('[CHECK-AUTH-STATUS] Error checking auth status:', error.message);
     return {
       content: [{ type: "text", text: "Not authenticated" }]
     };
   }
-  
-  console.error('[CHECK-AUTH-STATUS] Access token present');
-  console.error(`[CHECK-AUTH-STATUS] Token expires at: ${tokens.expires_at}`);
-  console.error(`[CHECK-AUTH-STATUS] Current time: ${Date.now()}`);
-  
-  return {
-    content: [{ type: "text", text: "Authenticated and ready" }]
-  };
 }
 
 // Tool definitions

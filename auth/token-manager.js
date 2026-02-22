@@ -1,11 +1,19 @@
 /**
  * Token management for Microsoft Graph API authentication
+ * With automatic token refresh support
  */
 const fs = require('fs');
+const https = require('https');
+const querystring = require('querystring');
 const config = require('../config');
+
+// Load environment variables from .env file
+require('dotenv').config();
 
 // Global variable to store tokens
 let cachedTokens = null;
+let isRefreshing = false;
+let refreshPromise = null;
 
 /**
  * Loads authentication tokens from the token file
@@ -14,62 +22,25 @@ let cachedTokens = null;
 function loadTokenCache() {
   try {
     const tokenPath = config.AUTH_CONFIG.tokenStorePath;
-    console.error(`[DEBUG] Attempting to load tokens from: ${tokenPath}`);
-    console.error(`[DEBUG] HOME directory: ${process.env.HOME}`);
-    console.error(`[DEBUG] Full resolved path: ${tokenPath}`);
     
-    // Log file existence and details
     if (!fs.existsSync(tokenPath)) {
-      console.error('[DEBUG] Token file does not exist');
+      console.error('[TOKEN] Token file does not exist');
       return null;
     }
-    
-    const stats = fs.statSync(tokenPath);
-    console.error(`[DEBUG] Token file stats:
-      Size: ${stats.size} bytes
-      Created: ${stats.birthtime}
-      Modified: ${stats.mtime}`);
     
     const tokenData = fs.readFileSync(tokenPath, 'utf8');
-    console.error('[DEBUG] Token file contents length:', tokenData.length);
-    console.error('[DEBUG] Token file first 200 characters:', tokenData.slice(0, 200));
+    const tokens = JSON.parse(tokenData);
     
-    try {
-      const tokens = JSON.parse(tokenData);
-      console.error('[DEBUG] Parsed tokens keys:', Object.keys(tokens));
-      
-      // Log each key's value to see what's present
-      Object.keys(tokens).forEach(key => {
-        console.error(`[DEBUG] ${key}: ${typeof tokens[key]}`);
-      });
-      
-      // Check for access token presence
-      if (!tokens.access_token) {
-        console.error('[DEBUG] No access_token found in tokens');
-        return null;
-      }
-      
-      // Check token expiration
-      const now = Date.now();
-      const expiresAt = tokens.expires_at || 0;
-      
-      console.error(`[DEBUG] Current time: ${now}`);
-      console.error(`[DEBUG] Token expires at: ${expiresAt}`);
-      
-      if (now > expiresAt) {
-        console.error('[DEBUG] Token has expired');
-        return null;
-      }
-      
-      // Update the cache
-      cachedTokens = tokens;
-      return tokens;
-    } catch (parseError) {
-      console.error('[DEBUG] Error parsing token JSON:', parseError);
+    if (!tokens.access_token) {
+      console.error('[TOKEN] No access_token found in tokens');
       return null;
     }
+    
+    // Update the cache
+    cachedTokens = tokens;
+    return tokens;
   } catch (error) {
-    console.error('[DEBUG] Error loading token cache:', error);
+    console.error('[TOKEN] Error loading token cache:', error.message);
     return null;
   }
 }
@@ -82,25 +53,190 @@ function loadTokenCache() {
 function saveTokenCache(tokens) {
   try {
     const tokenPath = config.AUTH_CONFIG.tokenStorePath;
-    console.error(`Saving tokens to: ${tokenPath}`);
-    
     fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
-    console.error('Tokens saved successfully');
+    console.error('[TOKEN] Tokens saved successfully');
     
     // Update the cache
     cachedTokens = tokens;
     return true;
   } catch (error) {
-    console.error('Error saving token cache:', error);
+    console.error('[TOKEN] Error saving token cache:', error.message);
     return false;
   }
 }
 
 /**
- * Gets the current access token, loading from cache if necessary
+ * Check if token is expired or about to expire (with 5 minute buffer)
+ * @param {object} tokens - Token object
+ * @returns {boolean} - True if token needs refresh
+ */
+function isTokenExpired(tokens) {
+  if (!tokens || !tokens.expires_at) {
+    return true;
+  }
+  
+  const now = Date.now();
+  const expiresAt = tokens.expires_at;
+  const bufferMs = 5 * 60 * 1000; // 5 minutes buffer
+  
+  return now >= (expiresAt - bufferMs);
+}
+
+/**
+ * Refresh access token using refresh token
+ * @param {string} refreshToken - The refresh token
+ * @returns {Promise<object>} - New token response
+ */
+function refreshAccessToken(refreshToken) {
+  return new Promise((resolve, reject) => {
+    const clientId = process.env.MS_CLIENT_ID || config.AUTH_CONFIG.clientId;
+    const clientSecret = process.env.MS_CLIENT_SECRET || config.AUTH_CONFIG.clientSecret;
+    
+    if (!clientId || !clientSecret) {
+      reject(new Error('MS_CLIENT_ID or MS_CLIENT_SECRET not configured'));
+      return;
+    }
+    
+    const scopes = [
+      'offline_access',
+      'User.Read',
+      'Mail.Read',
+      'Mail.Send',
+      'Calendars.Read',
+      'Calendars.ReadWrite',
+      'Contacts.Read'
+    ];
+    
+    const postData = querystring.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      scope: scopes.join(' ')
+    });
+
+    const options = {
+      hostname: 'login.microsoftonline.com',
+      path: '/common/oauth2/v2.0/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(response);
+          } else {
+            reject(new Error(`Token refresh failed: ${response.error_description || response.error}`));
+          }
+        } catch (e) {
+          reject(new Error(`Error parsing token response: ${e.message}`));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(new Error(`Network error during token refresh: ${error.message}`));
+    });
+    
+    req.write(postData);
+    req.end();
+  });
+}
+
+/**
+ * Perform token refresh and save to file
+ * @returns {Promise<string>} - New access token
+ */
+async function performTokenRefresh() {
+  const tokens = cachedTokens || loadTokenCache();
+  
+  if (!tokens || !tokens.refresh_token) {
+    throw new Error('No refresh token available');
+  }
+  
+  console.error('[TOKEN] Refreshing access token...');
+  
+  try {
+    const response = await refreshAccessToken(tokens.refresh_token);
+    
+    // Update tokens
+    tokens.access_token = response.access_token;
+    if (response.refresh_token) {
+      tokens.refresh_token = response.refresh_token;
+    }
+    tokens.expires_in = response.expires_in;
+    tokens.expires_at = Date.now() + (response.expires_in * 1000);
+    tokens.scope = response.scope;
+    tokens.token_type = response.token_type;
+    
+    // Save to file
+    saveTokenCache(tokens);
+    
+    console.error(`[TOKEN] Token refreshed successfully, expires at: ${new Date(tokens.expires_at).toLocaleString()}`);
+    
+    return tokens.access_token;
+  } catch (error) {
+    console.error('[TOKEN] Token refresh failed:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Gets the current access token, automatically refreshing if expired
+ * @returns {Promise<string|null>} - The access token or null if not available
+ */
+async function getAccessToken() {
+  // Use cached tokens if available
+  let tokens = cachedTokens;
+  
+  // Load from file if not cached
+  if (!tokens) {
+    tokens = loadTokenCache();
+  }
+  
+  if (!tokens || !tokens.access_token) {
+    console.error('[TOKEN] No access token available');
+    return null;
+  }
+  
+  // Check if token needs refresh
+  if (isTokenExpired(tokens)) {
+    console.error('[TOKEN] Token expired or expiring soon, attempting refresh...');
+    
+    // Prevent concurrent refresh attempts
+    if (isRefreshing) {
+      console.error('[TOKEN] Token refresh already in progress, waiting...');
+      return refreshPromise;
+    }
+    
+    isRefreshing = true;
+    refreshPromise = performTokenRefresh()
+      .finally(() => {
+        isRefreshing = false;
+        refreshPromise = null;
+      });
+    
+    return refreshPromise;
+  }
+  
+  // Token is still valid
+  return tokens.access_token;
+}
+
+/**
+ * Gets the current access token synchronously (without auto-refresh)
+ * Use this only when you don't need auto-refresh
  * @returns {string|null} - The access token or null if not available
  */
-function getAccessToken() {
+function getAccessTokenSync() {
   if (cachedTokens && cachedTokens.access_token) {
     return cachedTokens.access_token;
   }
@@ -128,5 +264,8 @@ module.exports = {
   loadTokenCache,
   saveTokenCache,
   getAccessToken,
-  createTestTokens
+  getAccessTokenSync,
+  createTestTokens,
+  isTokenExpired,
+  refreshAccessToken
 };
